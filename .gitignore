@@ -1,0 +1,35 @@
+## Build outputs
+**/bin/
+**/obj/
+**/_build_temp/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+*.userosscache
+*.sln.docstates
+
+## NuGet
+packages/
+**/packages/*
+*.nupkg
+*.nuspec
+
+## Rider
+.idea/
+
+## Miscellaneous
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+~*
+
+## Project specific
+PeriView.App/bin/
+PeriView.App/obj/
+
