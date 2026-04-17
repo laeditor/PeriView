@@ -28,6 +28,7 @@ public sealed class MainViewModel : ObservableObject
     {
         var providers = new IDeviceStatusProvider[]
         {
+            new BluetoothBatteryProvider(),
             new BatteryProviderRouter(), // 整合了多种电池提供者，包括HID直接通信和Windows属性回退
             new Usb24GBatteryProvider()
         };
@@ -138,7 +139,9 @@ public sealed class MainViewModel : ObservableObject
             }
 
             using var timeoutCts = new CancellationTokenSource(RefreshTimeout);
-            var statuses = await _aggregator.GetStatusesAsync(timeoutCts.Token);
+            var statuses = (await _aggregator.GetStatusesAsync(timeoutCts.Token))
+                .Where(status => !IsInfrastructurePlaceholder(status))
+                .ToList();
             var connectedStatuses = statuses.Where(x => x.IsConnected == true).ToList();
 
             if (statuses.Count == 0)
@@ -151,18 +154,21 @@ public sealed class MainViewModel : ObservableObject
 
             if (connectedStatuses.Count == 0 && hasSnapshot)
             {
-                StatusMessage = $"本次刷新发现 {statuses.Count} 台设备，但未识别到已连接状态，已保留上次列表。";
+                await System.Windows.Application.Current.Dispatcher.InvokeAsync(() => ApplyConnectedStatuses(Array.Empty<DeviceStatus>()));
+                _lastConnectedSnapshot.Clear();
+                _lastSnapshotTime = DateTimeOffset.MinValue;
+                StatusMessage = $"本次刷新发现 {statuses.Count} 台设备，但当前无已连接设备，已清空列表。";
                 return;
             }
 
             // 在UI线程上更新集合
-            List<DeviceStatus> orderedConnectedStatuses = new();
+            List<DeviceStatus> orderedStatuses = new();
             await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
             {
-                orderedConnectedStatuses = ApplyConnectedStatuses(connectedStatuses);
+                orderedStatuses = ApplyConnectedStatuses(connectedStatuses);
             });
 
-            _lastConnectedSnapshot = orderedConnectedStatuses
+            _lastConnectedSnapshot = orderedStatuses
                 .Select(CloneStatus)
                 .ToList();
             _lastSnapshotTime = DateTimeOffset.Now;
@@ -259,6 +265,31 @@ public sealed class MainViewModel : ObservableObject
         }
 
         return status.Name;
+    }
+
+    private static bool IsInfrastructurePlaceholder(DeviceStatus status)
+    {
+        if (string.IsNullOrWhiteSpace(status.Name))
+        {
+            return false;
+        }
+
+        var name = status.Name.Trim();
+        if (name.Equals("2.4G HID", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("NearLink Mouse Dongle", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (name.Contains("dongle", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("receiver", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("nearlink", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("接收器", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private bool CanCopySelectedDiagnostic()

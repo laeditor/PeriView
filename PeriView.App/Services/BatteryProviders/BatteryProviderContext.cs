@@ -116,9 +116,9 @@ public sealed class BatteryProviderContext : IBatteryProviderContext, IDisposabl
             IsCharging = isCharging,
             Source = source.ToString(),
             LastUpdated = DateTimeOffset.Now,
-            IsConnected = !isSleeping && (connectionStatus == null || 
-                connectionStatus.Equals("Connected", StringComparison.OrdinalIgnoreCase) ||
-                connectionStatus.Equals("Charging", StringComparison.OrdinalIgnoreCase)),
+            IsConnected = !isSleeping && connectionStatus is not null &&
+                (connectionStatus.Equals("Connected", StringComparison.OrdinalIgnoreCase) ||
+                 connectionStatus.Equals("Charging", StringComparison.OrdinalIgnoreCase)),
             DebugProperties = isSleeping ? "Sleeping" : null
         };
     }

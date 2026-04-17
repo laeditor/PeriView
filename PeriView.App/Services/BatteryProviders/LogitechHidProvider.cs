@@ -140,6 +140,17 @@ public sealed class LogitechHidProvider : IBatteryProvider, IDisposable
     {
         var deviceKey = GetDeviceKey(device);
         var displayName = GetDeviceDisplayName(device);
+
+        if (IsInfrastructureReceiver(device, displayName))
+        {
+            if (_devices.TryRemove(deviceKey, out _))
+            {
+                _context?.RemoveDevice(deviceKey);
+            }
+
+            Logger.Debug($"跳过接收器类HID接口: {displayName} ({device.DevicePath})");
+            return;
+        }
         
         Logger.Debug($"尝试读取罗技设备电池: {displayName} ({deviceKey})");
         
@@ -189,9 +200,6 @@ public sealed class LogitechHidProvider : IBatteryProvider, IDisposable
     {
         try
         {
-            // 这里需要实现具体的HID通信协议
-            // 由于蓝牙项目代码经过混淆，我们实现一个简化的版本
-            
             // 检查设备是否支持特征报告
             if (device.GetMaxFeatureReportLength() <= 0)
             {
@@ -209,22 +217,11 @@ public sealed class LogitechHidProvider : IBatteryProvider, IDisposable
                 
                 // 设置报告ID
                 buffer[0] = reportId;
-                
-                // 发送获取电池状态的请求
-                // 这里需要根据罗技设备的实际协议进行实现
-                // 由于协议复杂且不同设备可能不同，这里返回模拟数据用于测试
-                // 实际使用时需要根据具体设备实现
-                
-                // 模拟读取
-                await Task.Delay(100, cancellationToken);
-                
-                // 模拟返回数据
-                var random = new Random();
-                int percent = random.Next(0, 101);
-                bool isCharging = random.Next(0, 2) == 1;
-                bool isSleeping = random.Next(0, 10) == 0; // 10%概率休眠
-                
-                return (percent, isCharging, isSleeping);
+
+                // 当前尚未实现稳定的罗技私有HID电池协议，
+                // 禁止使用随机值，避免把离线设备错误显示为在线。
+                await Task.CompletedTask;
+                return null;
             }
         }
         catch (Exception ex)
@@ -232,6 +229,27 @@ public sealed class LogitechHidProvider : IBatteryProvider, IDisposable
             Logger.Error($"HID通信失败: {device.DevicePath}", ex);
             return null;
         }
+    }
+
+    private static bool IsInfrastructureReceiver(HidDevice device, string displayName)
+    {
+        var name = (displayName ?? string.Empty).Trim();
+        var path = device.DevicePath ?? string.Empty;
+        var loweredName = name.ToLowerInvariant();
+        var loweredPath = path.ToLowerInvariant();
+
+        if (loweredName.Contains("dongle") || loweredName.Contains("receiver") || loweredName.Contains("nearlink"))
+        {
+            return true;
+        }
+
+        // Nearlink 常见接收器接口。
+        if (loweredPath.Contains("vid_373b") && loweredPath.Contains("pid_10c9"))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>

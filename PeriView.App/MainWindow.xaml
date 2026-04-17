@@ -369,6 +369,39 @@
                 <DataGrid.Columns>
                     <DataGridTextColumn Header="设备名称" Binding="{Binding Name}" Width="2.25*" ElementStyle="{StaticResource DeviceNameTextStyle}"/>
 
+                    <DataGridTemplateColumn Header="连接类型" Width="0.9*" HeaderStyle="{StaticResource CenterHeaderStyle}">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <Border Padding="8,3"
+                                        CornerRadius="8"
+                                        HorizontalAlignment="Center"
+                                        BorderThickness="1">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Setter Property="Background" Value="#F0F4FA"/>
+                                            <Setter Property="BorderBrush" Value="#D1DCEB"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding TransportType}" Value="蓝牙">
+                                                    <Setter Property="Background" Value="#E7F4FF"/>
+                                                    <Setter Property="BorderBrush" Value="#BFDDF8"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding TransportType}" Value="2.4G">
+                                                    <Setter Property="Background" Value="#F2F6E8"/>
+                                                    <Setter Property="BorderBrush" Value="#D7E4B5"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding TransportType}" Value="其他">
+                                                    <Setter Property="Background" Value="#F6F1FA"/>
+                                                    <Setter Property="BorderBrush" Value="#DDD0EA"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <TextBlock Text="{Binding TransportType}" Style="{StaticResource BadgeTextStyle}"/>
+                                </Border>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+
                     <DataGridTemplateColumn Header="电量" Width="*" HeaderStyle="{StaticResource CenterHeaderStyle}">
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>

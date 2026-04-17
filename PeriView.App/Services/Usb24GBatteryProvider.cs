@@ -53,10 +53,7 @@ public sealed class Usb24GBatteryProvider : IDeviceStatusProvider
             var hidMouseInterfaces = await FindAllWithTimeoutAsync(mouseSelector, RequestedProperties, cancellationToken);
             if (hidMouseInterfaces.Count == 0)
             {
-                return new[]
-                {
-                    BuildEmptyStatus("未发现可访问的 HID 鼠标接口。")
-                };
+                return Array.Empty<DeviceStatus>();
             }
 
             var statusList = new List<DeviceStatus>();
@@ -88,7 +85,7 @@ public sealed class Usb24GBatteryProvider : IDeviceStatusProvider
                     DeviceKey = key,
                     Name = name,
                     Source = Name,
-                    IsConnected = connected ?? true,
+                    IsConnected = connected ?? false,
                     BatteryPercent = battery,
                     LastUpdated = DateTimeOffset.Now,
                     Error = diagnostic,
@@ -98,10 +95,7 @@ public sealed class Usb24GBatteryProvider : IDeviceStatusProvider
 
             if (statusList.Count == 0)
             {
-                return new[]
-                {
-                    BuildEmptyStatus("已发现 HID 鼠标接口，但未识别到 2.4G 设备。")
-                };
+                return Array.Empty<DeviceStatus>();
             }
 
             return statusList;
@@ -119,7 +113,7 @@ public sealed class Usb24GBatteryProvider : IDeviceStatusProvider
                     DeviceKey = "2.4g-hid-timeout",
                     Name = "2.4G HID",
                     Source = Name,
-                    IsConnected = true,
+                    IsConnected = false,
                     LastUpdated = DateTimeOffset.Now,
                     Error = $"实时枚举超时（>{EnumerationTimeout.TotalSeconds:0} 秒），已跳过本轮 2.4G 查询。"
                 }
@@ -134,7 +128,7 @@ public sealed class Usb24GBatteryProvider : IDeviceStatusProvider
                     DeviceKey = "2.4g-hid-error",
                     Name = "2.4G HID",
                     Source = Name,
-                    IsConnected = true,
+                    IsConnected = false,
                     LastUpdated = DateTimeOffset.Now,
                     Error = $"实时枚举失败: {ex.GetType().Name}: {ex.Message}"
                 }
@@ -149,7 +143,7 @@ public sealed class Usb24GBatteryProvider : IDeviceStatusProvider
             DeviceKey = "2.4g-hid-empty",
             Name = "2.4G HID",
             Source = "2.4G HID",
-            IsConnected = true,
+            IsConnected = false,
             LastUpdated = DateTimeOffset.Now,
             Error = message
         };

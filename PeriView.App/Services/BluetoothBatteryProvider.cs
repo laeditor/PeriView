@@ -24,20 +24,32 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
     private static readonly TimeSpan AudioAssociationProbeTimeout = TimeSpan.FromMilliseconds(4000);
     private static readonly TimeSpan BatteryResolutionBudget = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan AudioCapabilityProbeBudget = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan FastAudioUiProbeTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan PrivateProtocolProbeTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromMilliseconds(350);
-    private static readonly TimeSpan UiSettingsWakeCooldown = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan UiSettingsWakeCooldown = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan LastKnownBatteryTtl = TimeSpan.FromMinutes(30);
     private static readonly bool EnableUiSettingsWake = false;
+    private static readonly bool EnableDeepBatteryResolution = false;
+    private static readonly bool EnableActiveGattBatteryRead = true;
     private const int MaxConcurrentDeviceQueries = 3;
     private static readonly ConcurrentDictionary<string, (int Battery, DateTimeOffset Time)> LastKnownBatteryByDeviceKey = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Guid BluetoothAepProtocolId = Guid.Parse("{bb7bb05e-5972-42b5-94fc-76eaa7084d49}");
+    private static readonly Guid[] HuaweiPrivateServiceUuids =
+    {
+        Guid.Parse("0000FE2C-0000-1000-8000-00805F9B34FB"),
+        Guid.Parse("0000FE2D-0000-1000-8000-00805F9B34FB"),
+        Guid.Parse("0000FEE7-0000-1000-8000-00805F9B34FB")
+    };
 
     private static readonly Regex BluetoothAddressRegex = new(@"([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}", RegexOptions.Compiled);
-    private static readonly Regex UiConnectedBatteryPatternCn = new(@"^(?<name>[^、,，]+?)\s*[、,，]\s*类别[^、,，]*\s*[、,，]\s*电池\s*(?<battery>\d{1,3})%\s*[、,，].*$", RegexOptions.Compiled);
-    private static readonly Regex UiBatteryPatternCnLoose = new(@"电池\s*(?<battery>\d{1,3})%", RegexOptions.Compiled);
-    private static readonly Regex UiBatteryPatternEnLoose = new(@"battery\s*(?<battery>\d{1,3})%", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex UiConnectedBatteryPatternCn = new(@"^(?<name>[^、,，]+?)\s*[、,，]\s*类别[^、,，]*\s*[、,，]\s*电池\s*(?<battery>\d{1,3})\s*[%％]\s*[、,，].*$", RegexOptions.Compiled);
+    private static readonly Regex UiConnectedBatteryPatternGeneric = new(@"^(?<name>[^、,，|:：\-]+?)\s*(?:[、,，|:：\-]\s*)?.*?(?:电池|battery)\s*(?<battery>\d{1,3})\s*[%％]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex UiConnectedBatteryPatternNoSeparator = new(@"^(?<name>.+?)\s*(?:电池|battery)\s*(?<battery>\d{1,3})\s*[%％].*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex UiBatteryPatternCnLoose = new(@"电池\s*(?<battery>\d{1,3})\s*[%％]", RegexOptions.Compiled);
+    private static readonly Regex UiBatteryPatternEnLoose = new(@"battery\s*(?<battery>\d{1,3})\s*[%％]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     // 更宽松的匹配：设备名 + 电池 + 数字 + %
-    private static readonly Regex UiBatteryUltraLoose = new(@"(?<name>.+?)[、,，].*?电池\s*(?<battery>\d{1,3})%", RegexOptions.Compiled);
+    private static readonly Regex UiBatteryUltraLoose = new(@"(?<name>.+?)[、,，].*?(?:电池|battery)\s*(?<battery>\d{1,3})\s*[%％]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly string[] ConnectionPropertyNames =
     {
@@ -473,17 +485,14 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
             MaxConcurrentDeviceQueries,
             async (info, ct) =>
             {
-                var isConnected = TryGetConnectionProperty(info);
-                isConnected ??= await ResolveClassicConnectionAsync(info.Id, ct);
-                if (!isConnected.HasValue && IsPaired(info))
-                {
-                    isConnected = false;
-                }
+                var propertyConnection = TryGetConnectionProperty(info);
+                var runtimeConnection = await ResolveClassicConnectionAsync(info.Id, ct);
 
                 // 对经典设备，即使连接状态未确认也尝试系统属性读取；
                 // Windows 托盘/设置页常能提供缓存电量，但连接位可能短暂不同步。
                 var batteryResolution = await ResolveBatteryPercentWithBudgetAsync(info, discoveryCache, ct);
-                var resolvedBattery = batteryResolution.BatteryPercent;
+                var liveResolvedBattery = batteryResolution.BatteryPercent;
+                var resolvedBattery = liveResolvedBattery;
                 if (!resolvedBattery.HasValue && TryGetLastKnownBattery(info, out var cachedBattery))
                 {
                     resolvedBattery = cachedBattery;
@@ -492,8 +501,25 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
                 {
                     SetLastKnownBattery(info, resolvedBattery.Value);
                 }
-                var audioProbe = resolvedBattery.HasValue
-                    ? BuildSkippedAudioProbeResult("audio-probe: skipped (battery already resolved)")
+
+                // 经典蓝牙的属性连接位可能滞后，优先采用运行时连接状态。
+                // 当运行时状态不可用时，仅在本轮实时解析到电量时才将属性连接位作为“在线”证据。
+                var isConnected = IsLikelyAudioDevice(info)
+                    ? (runtimeConnection ?? propertyConnection ?? false)
+                    : (runtimeConnection ?? (propertyConnection == true && liveResolvedBattery.HasValue));
+
+                // 鼠标/指针类设备对“是否在线”更敏感：运行时无法确认时，默认按离线处理，避免断开后仍残留在列表。
+                if (IsLikelyPointerDevice(info) && runtimeConnection != true)
+                {
+                    isConnected = false;
+                }
+
+                if (!isConnected && IsPaired(info) && runtimeConnection is null)
+                {
+                    isConnected = false;
+                }
+                var audioProbe = resolvedBattery.HasValue || !EnableDeepBatteryResolution
+                    ? BuildSkippedAudioProbeResult("audio-probe: skipped (fast mode or battery already resolved)")
                     : await BuildAudioCapabilityProbeWithBudgetAsync(info, null, ct);
                 var classicDiagnostic = BuildClassicDeviceMessageAsync(info, resolvedBattery, audioProbe);
 
@@ -640,7 +666,7 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
                     DeviceKey = BuildLogicalDeviceKey(info),
                     Name = string.IsNullOrWhiteSpace(info.Name) ? "Unknown BLE Device" : info.Name,
                     Source = "Bluetooth BLE",
-                    IsConnected = false,
+                    IsConnected = isConnected ?? false,
                     BatteryPercent = null,
                     LastUpdated = DateTimeOffset.Now,
                     Error = "无法创建设备连接对象，可能是设备不可访问或已断开。"
@@ -652,8 +678,31 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
                 // 获取设备名称（优先使用 BLE 设备提供的名称）
                 var deviceName = !string.IsNullOrWhiteSpace(ble.Name) ? ble.Name : info.Name;
 
-                isConnected ??= ble.ConnectionStatus == BluetoothConnectionStatus.Connected;
-                isConnected ??= await ProbeBleReachabilityAsync(ble, cancellationToken);
+                var propertyConnection = isConnected;
+                var runtimeConnection = ble.ConnectionStatus == BluetoothConnectionStatus.Connected
+                    ? true
+                    : false;
+                var reachabilityConnection = await ProbeBleReachabilityAsync(ble, cancellationToken);
+                isConnected = runtimeConnection == true
+                    ? true
+                    : reachabilityConnection == true
+                        ? true
+                        : runtimeConnection == false
+                            ? false
+                            : propertyConnection;
+                var hasPositiveConnectionEvidence = runtimeConnection == true || reachabilityConnection == true;
+
+                // 对鼠标类设备更保守：运行时未确认连接时，不接受属性缓存导致的“在线”。
+                if (IsLikelyPointerDevice(info) && runtimeConnection != true)
+                {
+                    isConnected = false;
+                }
+
+                // 音频设备常见场景：运行时状态短暂为未连接，但系统属性仍保持连接且可读取系统电量。
+                if (IsLikelyAudioDevice(info) && propertyConnection == true && runtimeConnection != true && reachabilityConnection != false)
+                {
+                    isConnected = true;
+                }
 
                 if (!isConnected.HasValue && IsPaired(info))
                 {
@@ -664,9 +713,14 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
                 if (isConnected != true)
                 {
                     var disconnectedBatteryResolution = await ResolveBatteryPercentWithBudgetAsync(info, discoveryCache, cancellationToken);
-                    var disconnectedAudioProbe = disconnectedBatteryResolution.BatteryPercent.HasValue
-                        ? BuildSkippedAudioProbeResult("audio-probe: skipped (battery already resolved)")
+                    var disconnectedAudioProbe = disconnectedBatteryResolution.BatteryPercent.HasValue || !EnableDeepBatteryResolution
+                        ? BuildSkippedAudioProbeResult("audio-probe: skipped (fast mode or battery already resolved)")
                         : await BuildAudioCapabilityProbeWithBudgetAsync(info, ble, cancellationToken);
+
+                    if (IsLikelyAudioDevice(info) && propertyConnection == true && disconnectedBatteryResolution.BatteryPercent.HasValue)
+                    {
+                        isConnected = true;
+                    }
 
                     var diagnostic = disconnectedBatteryResolution.BatteryPercent.HasValue
                         ? "连接状态未确认，但已从系统属性/缓存读取到电量。"
@@ -696,6 +750,30 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
 
                 // 设备已连接，查询电量
                 var batteryResolution = await ResolveBatteryPercentWithBudgetAsync(info, discoveryCache, cancellationToken);
+                var resolvedBattery = batteryResolution.BatteryPercent;
+                string? audioBatteryNote = null;
+
+                if (IsLikelyAudioDevice(info))
+                {
+                    try
+                    {
+                        var (uiBattery, uiTrace) = await WithOperationTimeoutAsync(
+                            ct => TryReadBatteryFromUiAutomationCacheAsync(info, discoveryCache, ct),
+                            FastAudioUiProbeTimeout,
+                            cancellationToken,
+                            "音频设备 UIA 电量探测超时");
+
+                        if (uiBattery.HasValue)
+                        {
+                            resolvedBattery = uiBattery;
+                            audioBatteryNote = $"音频设备优先采用系统界面电量（UIA）。{uiTrace}";
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore UIA probe failures and keep prior resolved battery.
+                    }
+                }
 
                 var status = new DeviceStatus
                 {
@@ -703,16 +781,29 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
                     Name = string.IsNullOrWhiteSpace(deviceName) ? "Unknown BLE Device" : deviceName,
                     Source = "Bluetooth BLE",
                     IsConnected = true,
-                    BatteryPercent = batteryResolution.BatteryPercent,
+                    BatteryPercent = resolvedBattery,
                     LastUpdated = DateTimeOffset.Now
                 };
 
-                // Some BLE devices report disconnected while idle, but still allow on-demand GATT reads.
-                status.Error = await TryReadBatteryLevelAsync(ble, status, cancellationToken);
+                var preferSystemAudioBattery = IsLikelyAudioDevice(info) && status.BatteryPercent.HasValue;
 
-                if (!status.BatteryPercent.HasValue && IsTransientGattError(status.Error))
+                if (EnableActiveGattBatteryRead && !preferSystemAudioBattery)
                 {
-                    status.Error = await TryReconnectAndReadBatteryAsync(info, status, cancellationToken);
+                    // Some BLE devices report disconnected while idle, but still allow on-demand GATT reads.
+                    status.Error = await TryReadBatteryLevelAsync(ble, status, cancellationToken);
+
+                    if (!status.BatteryPercent.HasValue && IsTransientGattError(status.Error))
+                    {
+                        status.Error = await TryReconnectAndReadBatteryAsync(info, status, cancellationToken);
+                    }
+                }
+                else if (preferSystemAudioBattery)
+                {
+                    status.Error = audioBatteryNote ?? "音频设备优先采用系统电量来源，以与系统托盘保持一致。";
+                }
+                else if (!status.BatteryPercent.HasValue)
+                {
+                    status.Error = "快速模式: 已跳过主动 GATT 电量读取。";
                 }
 
                 if (status.BatteryPercent.HasValue)
@@ -720,7 +811,7 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
                     status.IsConnected = true;
                     SetLastKnownBattery(info, status.BatteryPercent.Value);
                 }
-                else if (TryGetLastKnownBattery(info, out var cachedBattery))
+                else if (hasPositiveConnectionEvidence && TryGetLastKnownBattery(info, out var cachedBattery))
                 {
                     status.BatteryPercent = cachedBattery;
                     status.Error = "当前未读取到实时电量，已回退到最近一次成功值。";
@@ -730,8 +821,13 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
                     status.Error = "未通过 GATT 读到电量，且系统属性中无电量值。";
                 }
 
-                var audioProbe = status.BatteryPercent.HasValue
-                    ? BuildSkippedAudioProbeResult("audio-probe: skipped (battery already resolved)")
+                if (!hasPositiveConnectionEvidence)
+                {
+                    status.IsConnected = false;
+                }
+
+                var audioProbe = status.BatteryPercent.HasValue || !EnableDeepBatteryResolution
+                    ? BuildSkippedAudioProbeResult("audio-probe: skipped (fast mode or battery already resolved)")
                     : await BuildAudioCapabilityProbeWithBudgetAsync(info, ble, cancellationToken);
                 if (!status.BatteryPercent.HasValue && audioProbe.IsAudioCandidate)
                 {
@@ -1188,6 +1284,167 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
         }
 
         trace.Add("direct-properties: miss");
+
+        var allowDeepResolution = EnableDeepBatteryResolution || IsLikelyAudioDevice(info);
+        if (!allowDeepResolution)
+        {
+            trace.Add("fast-battery-resolution: enabled");
+            var candidateAddressesFast = GetCandidateBluetoothAddresses(info);
+            if (candidateAddressesFast.Count > 0)
+            {
+                trace.Add($"address-candidates: {string.Join(",", candidateAddressesFast)}");
+
+                var fromRelatedByAddressFast = await TryReadBatteryFromRelatedBleEndpointByAddressAsync(
+                    await GetBleEndpointsAsync(),
+                    candidateAddressesFast);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (fromRelatedByAddressFast.HasValue)
+                {
+                    trace.Add($"related-ble-by-address: hit {fromRelatedByAddressFast.Value}%");
+                    return new BatteryResolutionResult { BatteryPercent = fromRelatedByAddressFast, Trace = string.Join("\n", trace) };
+                }
+
+                var fromClassicEndpointFast = await TryReadBatteryFromRelatedClassicEndpointByAddressAsync(
+                    await GetClassicEndpointsAsync(),
+                    candidateAddressesFast,
+                    cancellationToken);
+                if (fromClassicEndpointFast.HasValue)
+                {
+                    trace.Add($"related-classic-endpoint-by-address: hit {fromClassicEndpointFast.Value}%");
+                    return new BatteryResolutionResult { BatteryPercent = fromClassicEndpointFast, Trace = string.Join("\n", trace) };
+                }
+
+                if (IsLikelyAudioDevice(info))
+                {
+                    var (fromHuaweiPrivateFast, huaweiPrivateFastTrace) = await TryReadBatteryFromHuaweiPrivateProtocolAsync(info, null, cancellationToken);
+                    trace.Add(huaweiPrivateFastTrace);
+                    if (fromHuaweiPrivateFast.HasValue)
+                    {
+                        trace.Add($"huawei-private-fast: hit {fromHuaweiPrivateFast.Value}%");
+                        return new BatteryResolutionResult
+                        {
+                            BatteryPercent = fromHuaweiPrivateFast,
+                            Trace = string.Join("\n", trace),
+                            InterfaceProbeDump = interfaceProbeDump
+                        };
+                    }
+
+                    var (fromMediaFast, mediaFastTrace) = await TryReadBatteryFromMediaDeviceAsync(info, candidateAddressesFast, cancellationToken);
+                    trace.Add(mediaFastTrace);
+                    if (fromMediaFast.HasValue)
+                    {
+                        trace.Add($"media-device-fast: hit {fromMediaFast.Value}%");
+                        return new BatteryResolutionResult
+                        {
+                            BatteryPercent = fromMediaFast,
+                            Trace = string.Join("\n", trace),
+                            InterfaceProbeDump = interfaceProbeDump
+                        };
+                    }
+
+                    var (fromAudioAepFast, audioAepFastTrace) = await TryReadBatteryFromAudioAssociationEndpointsAsync(info, candidateAddressesFast, cancellationToken);
+                    trace.Add(audioAepFastTrace);
+                    if (fromAudioAepFast.HasValue)
+                    {
+                        trace.Add($"audio-aep-fast: hit {fromAudioAepFast.Value}%");
+                        return new BatteryResolutionResult
+                        {
+                            BatteryPercent = fromAudioAepFast,
+                            Trace = string.Join("\n", trace),
+                            InterfaceProbeDump = interfaceProbeDump
+                        };
+                    }
+
+                    try
+                    {
+                        var (fromUiAudioFast, uiAudioTrace) = await WithOperationTimeoutAsync(
+                            ct => TryReadBatteryFromUiAutomationCacheAsync(info, discoveryCache, ct),
+                            FastAudioUiProbeTimeout,
+                            cancellationToken,
+                            "快速音频 UIA 探测超时");
+                        trace.Add(uiAudioTrace);
+                        if (fromUiAudioFast.HasValue)
+                        {
+                            trace.Add($"uia-audio-fast: hit {fromUiAudioFast.Value}%");
+                            return new BatteryResolutionResult
+                            {
+                                BatteryPercent = fromUiAudioFast,
+                                Trace = string.Join("\n", trace),
+                                InterfaceProbeDump = interfaceProbeDump
+                            };
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        trace.Add($"uia-audio-fast: failed {ex.GetType().Name}");
+                    }
+                }
+            }
+            else
+            {
+                trace.Add("address-candidates: none");
+
+                if (IsLikelyAudioDevice(info))
+                {
+                    var (fromMediaFastNoAddr, mediaFastNoAddrTrace) = await TryReadBatteryFromMediaDeviceAsync(info, Array.Empty<string>(), cancellationToken);
+                    trace.Add(mediaFastNoAddrTrace);
+                    if (fromMediaFastNoAddr.HasValue)
+                    {
+                        trace.Add($"media-device-fast(no-address): hit {fromMediaFastNoAddr.Value}%");
+                        return new BatteryResolutionResult
+                        {
+                            BatteryPercent = fromMediaFastNoAddr,
+                            Trace = string.Join("\n", trace),
+                            InterfaceProbeDump = interfaceProbeDump
+                        };
+                    }
+
+                    var (fromAudioAepFastNoAddr, audioAepFastNoAddrTrace) = await TryReadBatteryFromAudioAssociationEndpointsAsync(info, Array.Empty<string>(), cancellationToken);
+                    trace.Add(audioAepFastNoAddrTrace);
+                    if (fromAudioAepFastNoAddr.HasValue)
+                    {
+                        trace.Add($"audio-aep-fast(no-address): hit {fromAudioAepFastNoAddr.Value}%");
+                        return new BatteryResolutionResult
+                        {
+                            BatteryPercent = fromAudioAepFastNoAddr,
+                            Trace = string.Join("\n", trace),
+                            InterfaceProbeDump = interfaceProbeDump
+                        };
+                    }
+
+                    try
+                    {
+                        var (fromUiAudioFastNoAddr, uiAudioNoAddrTrace) = await WithOperationTimeoutAsync(
+                            ct => TryReadBatteryFromUiAutomationCacheAsync(info, discoveryCache, ct),
+                            FastAudioUiProbeTimeout,
+                            cancellationToken,
+                            "快速音频 UIA 探测超时");
+                        trace.Add(uiAudioNoAddrTrace);
+                        if (fromUiAudioFastNoAddr.HasValue)
+                        {
+                            trace.Add($"uia-audio-fast(no-address): hit {fromUiAudioFastNoAddr.Value}%");
+                            return new BatteryResolutionResult
+                            {
+                                BatteryPercent = fromUiAudioFastNoAddr,
+                                Trace = string.Join("\n", trace),
+                                InterfaceProbeDump = interfaceProbeDump
+                            };
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        trace.Add($"uia-audio-fast(no-address): failed {ex.GetType().Name}");
+                    }
+                }
+            }
+
+            return new BatteryResolutionResult
+            {
+                BatteryPercent = null,
+                Trace = string.Join("\n", trace),
+                InterfaceProbeDump = interfaceProbeDump
+            };
+        }
 
         // UIA 路径对所有设备开启，尝试从Windows设置页面读取电量
         var (fromUiAutomationPriority, uiProbeTracePriority) = await TryReadBatteryFromUiAutomationCacheAsync(info, discoveryCache, cancellationToken);
@@ -2629,6 +2886,25 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
                 || classGuid.Contains("4d36e96c", StringComparison.OrdinalIgnoreCase));
     }
 
+    private static bool IsLikelyPointerDevice(DeviceInformation info)
+    {
+        var name = info.Name;
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = GetStringProperty(info, "System.ItemNameDisplay") ?? string.Empty;
+        }
+
+        var lowered = name.ToLowerInvariant();
+        if (lowered.Contains("mouse") || lowered.Contains("mice") || lowered.Contains("trackball") || lowered.Contains("鼠标"))
+        {
+            return true;
+        }
+
+        var classGuid = GetStringProperty(info, "System.Devices.ClassGuid");
+        return !string.IsNullOrWhiteSpace(classGuid)
+            && classGuid.Contains("4d36e96f", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static async Task<AudioCapabilityProbeResult> BuildAudioCapabilityProbeAsync(
         DeviceInformation info,
         BluetoothLEDevice? existingBle,
@@ -3913,6 +4189,143 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
         return keywords.Any(keyword => text.Contains(keyword, StringComparison.OrdinalIgnoreCase));
     }
 
+    private static async Task<(int? battery, string trace)> TryReadBatteryFromHuaweiPrivateProtocolAsync(
+        DeviceInformation info,
+        BluetoothLEDevice? existingBle,
+        CancellationToken cancellationToken)
+    {
+        var name = string.IsNullOrWhiteSpace(info.Name) ? GetStringProperty(info, "System.ItemNameDisplay") : info.Name;
+        if (string.IsNullOrWhiteSpace(name) ||
+            (!name.Contains("HUAWEI", StringComparison.OrdinalIgnoreCase) &&
+             !name.Contains("FREEBUDS", StringComparison.OrdinalIgnoreCase)))
+        {
+            return (null, "huawei-private: skipped non-huawei-device");
+        }
+
+        var ownsBle = false;
+        BluetoothLEDevice? ble = existingBle;
+
+        try
+        {
+            if (ble is null)
+            {
+                ble = await CreateBleDeviceWithRetryAsync(info, cancellationToken);
+                ownsBle = ble is not null;
+            }
+
+            if (ble is null)
+            {
+                return (null, "huawei-private: ble-create-failed");
+            }
+
+            var serviceResult = await WithOperationTimeoutAsync(
+                ct => ble.GetGattServicesAsync(BluetoothCacheMode.Cached).AsTask(ct),
+                PrivateProtocolProbeTimeout,
+                cancellationToken,
+                "华为私有协议服务枚举超时");
+
+            if (serviceResult.Status != GattCommunicationStatus.Success || serviceResult.Services.Count == 0)
+            {
+                return (null, $"huawei-private: service-status={serviceResult.Status}");
+            }
+
+            var candidateServices = serviceResult.Services
+                .Where(s => HuaweiPrivateServiceUuids.Contains(s.Uuid) || IsLikelyHuaweiPrivateService(s.Uuid))
+                .ToList();
+
+            foreach (var service in candidateServices)
+            {
+                using (service)
+                {
+                    var chResult = await WithOperationTimeoutAsync(
+                        ct => service.GetCharacteristicsAsync(BluetoothCacheMode.Cached).AsTask(ct),
+                        GattOperationTimeout,
+                        cancellationToken,
+                        "华为私有协议特征枚举超时");
+
+                    if (chResult.Status != GattCommunicationStatus.Success || chResult.Characteristics.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    foreach (var ch in chResult.Characteristics)
+                    {
+                        if (!ch.CharacteristicProperties.HasFlag(GattCharacteristicProperties.Read))
+                        {
+                            continue;
+                        }
+
+                        var readResult = await WithOperationTimeoutAsync(
+                            ct => ch.ReadValueAsync(BluetoothCacheMode.Cached).AsTask(ct),
+                            GattOperationTimeout,
+                            cancellationToken,
+                            "华为私有协议特征读取超时");
+
+                        if (readResult.Status != GattCommunicationStatus.Success || readResult.Value is null)
+                        {
+                            continue;
+                        }
+
+                        using var reader = DataReader.FromBuffer(readResult.Value);
+                        var payload = new byte[reader.UnconsumedBufferLength];
+                        reader.ReadBytes(payload);
+                        if (TryParseHuaweiPrivateBattery(payload, out var battery))
+                        {
+                            return (battery, $"huawei-private: hit service={service.Uuid}, char={ch.Uuid}");
+                        }
+                    }
+                }
+            }
+
+            return (null, $"huawei-private: no-hit services={candidateServices.Count}");
+        }
+        catch (Exception ex)
+        {
+            return (null, $"huawei-private: {ex.GetType().Name}");
+        }
+        finally
+        {
+            if (ownsBle)
+            {
+                ble?.Dispose();
+            }
+        }
+    }
+
+    private static bool IsLikelyHuaweiPrivateService(Guid serviceUuid)
+    {
+        var text = serviceUuid.ToString("N");
+        return text.StartsWith("0000fe", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryParseHuaweiPrivateBattery(IReadOnlyList<byte> payload, out int battery)
+    {
+        battery = -1;
+        if (payload.Count == 0)
+        {
+            return false;
+        }
+
+        var candidates = new List<int>();
+        for (var i = 0; i < payload.Count; i++)
+        {
+            var value = payload[i];
+            if (value is > 0 and <= 100)
+            {
+                candidates.Add(value);
+            }
+        }
+
+        if (candidates.Count == 0)
+        {
+            return false;
+        }
+
+        // 对耳机/耳仓场景取最小值，通常更接近系统托盘显示。
+        battery = candidates.Min();
+        return true;
+    }
+
     private static async Task<IReadOnlyList<DeviceInformation>> FindMediaEndpointsSafeAsync(
         string selector,
         string channel,
@@ -3923,7 +4336,11 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
 
         try
         {
-            var devices = await DeviceInformation.FindAllAsync(selector);
+            var devices = await WithOperationTimeoutAsync(
+                ct => DeviceInformation.FindAllAsync(selector).AsTask(ct),
+                AudioAssociationProbeTimeout,
+                cancellationToken,
+                $"媒体端点枚举超时({channel})");
             traceNotes.Add($"media-enum-{channel}: {devices.Count} endpoints");
             return devices;
         }
@@ -4045,6 +4462,26 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
 
         if (best is null || bestScore < 1)
         {
+            // 音频设备常见 UI 文本名与设备名不完全一致：
+            // 1) 只有一个候选时直接采用；
+            // 2) 否则使用规范化名称近似匹配回退。
+            if (IsLikelyAudioDevice(source) && entries.Count == 1)
+            {
+                var single = entries[0];
+                return (single.BatteryPercent, $"uia-cache: candidates=1, fallback=single-entry, hit={single.DeviceName}:{single.BatteryPercent}%, text={single.RawText}");
+            }
+
+            if (IsLikelyAudioDevice(source))
+            {
+                foreach (var entry in entries)
+                {
+                    if (IsLooseUiNameMatch(targetName, entry.DeviceName))
+                    {
+                        return (entry.BatteryPercent, $"uia-cache: candidates={entries.Count}, fallback=loose-name, hit={entry.DeviceName}:{entry.BatteryPercent}%, text={entry.RawText}");
+                    }
+                }
+            }
+
             return (null, $"uia-cache: candidates={entries.Count}, best-score={bestScore}, miss");
         }
 
@@ -4057,26 +4494,28 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var debugTexts = new List<string>(); // 用于调试
 
-        // 尝试打开蓝牙设置页面
+        // 仅在显式启用时尝试打开蓝牙设置页面，默认保持静默扫描。
         Process? settingsProcess = null;
         bool openedByUs = false;
         try
         {
-            // 检查是否已有设置页面打开
-            var existingSettings = Process.GetProcessesByName("SystemSettings").FirstOrDefault();
-            if (existingSettings == null)
+            if (EnableUiSettingsWake)
             {
+                // 强制尝试唤起蓝牙设置页：SystemSettings 进程常驻时仅检测进程会误判为“已打开”。
                 settingsProcess = TryStartBluetoothSettingsMinimized();
                 if (settingsProcess != null)
                 {
                     openedByUs = true;
-                    Thread.Sleep(3000); // 等待页面加载和电量刷新
+                    Thread.Sleep(2500); // 等待页面加载和电量刷新
+                }
+                else
+                {
+                    Thread.Sleep(600);
                 }
             }
             else
             {
-                // 如果设置页面已打开，给一点时间让数据刷新
-                Thread.Sleep(500);
+                Thread.Sleep(250);
             }
         }
         catch { }
@@ -4264,18 +4703,62 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
             }
         }
 
+        // 兼容英文和混合语言界面，例如 "WH-1000XM5, Audio, Battery 78%, Connected"
+        var genericMatch = UiConnectedBatteryPatternGeneric.Match(text);
+        if (genericMatch.Success)
+        {
+            deviceName = genericMatch.Groups["name"].Value.Trim();
+            if (IsLikelyUiDeviceName(deviceName) && int.TryParse(genericMatch.Groups["battery"].Value, out batteryPercent) && batteryPercent is >= 0 and <= 100)
+            {
+                return true;
+            }
+        }
+
+        // 兼容没有逗号分隔的文本，例如 "HUAWEI FreeBuds Pro 3 电池 82%"
+        var noSeparatorMatch = UiConnectedBatteryPatternNoSeparator.Match(text);
+        if (noSeparatorMatch.Success)
+        {
+            deviceName = noSeparatorMatch.Groups["name"].Value.Trim();
+            if (IsLikelyUiDeviceName(deviceName) && int.TryParse(noSeparatorMatch.Groups["battery"].Value, out batteryPercent) && batteryPercent is >= 0 and <= 100)
+            {
+                return true;
+            }
+        }
+
         // 尝试超宽松匹配
         var looseMatch = UiBatteryUltraLoose.Match(text);
         if (looseMatch.Success)
         {
             deviceName = looseMatch.Groups["name"].Value.Trim();
-            if (int.TryParse(looseMatch.Groups["battery"].Value, out batteryPercent) && batteryPercent is >= 0 and <= 100)
+            if (IsLikelyUiDeviceName(deviceName) && int.TryParse(looseMatch.Groups["battery"].Value, out batteryPercent) && batteryPercent is >= 0 and <= 100)
             {
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static bool IsLikelyUiDeviceName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var text = name.Trim();
+        if (text.Length < 2 || text.Length > 80)
+        {
+            return false;
+        }
+
+        // 过滤明显不是设备名的UI文本（路径/代码片段/命令输出）。
+        if (text.Contains('\\') || text.Contains(".cs", StringComparison.OrdinalIgnoreCase) || text.Contains("namespace", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return true;
     }
 
     private static Process? TryStartBluetoothSettingsMinimized()
@@ -4405,6 +4888,51 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
         return score;
     }
 
+    private static bool IsLooseUiNameMatch(string targetName, string candidateName)
+    {
+        if (string.IsNullOrWhiteSpace(targetName) || string.IsNullOrWhiteSpace(candidateName))
+        {
+            return false;
+        }
+
+        static string Normalize(string text)
+        {
+            var chars = text
+                .Where(c => char.IsLetterOrDigit(c))
+                .Select(char.ToLowerInvariant)
+                .ToArray();
+            return new string(chars);
+        }
+
+        var t = Normalize(targetName);
+        var c = Normalize(candidateName);
+        if (string.IsNullOrWhiteSpace(t) || string.IsNullOrWhiteSpace(c))
+        {
+            return false;
+        }
+
+        if (t.Equals(c, StringComparison.Ordinal) || t.Contains(c, StringComparison.Ordinal) || c.Contains(t, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var tokens = targetName
+            .Split(new[] { ' ', '-', '_', '(', ')', '[', ']' }, StringSplitOptions.RemoveEmptyEntries)
+            .Where(x => x.Length >= 3)
+            .Select(Normalize)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        if (tokens.Length == 0)
+        {
+            return false;
+        }
+
+        var hits = tokens.Count(token => c.Contains(token, StringComparison.Ordinal));
+        return hits >= Math.Max(1, tokens.Length / 2);
+    }
+
     private static void SetLastKnownBattery(DeviceInformation info, int batteryPercent)
     {
         if (batteryPercent is < 0 or > 100)
@@ -4450,7 +4978,7 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
         var hasBattery = text.Contains("电池", StringComparison.OrdinalIgnoreCase) ||
                          text.Contains("battery", StringComparison.OrdinalIgnoreCase);
         // 只要有"电池"关键字和百分号即可，不要求"已连接"
-        var hasPercent = text.Contains('%');
+        var hasPercent = text.Contains('%') || text.Contains('％');
         return hasBattery && hasPercent;
     }
 
@@ -4482,10 +5010,15 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
 
             probeToken.ThrowIfCancellationRequested();
 
-            var endpoints = await DeviceInformation.FindAllAsync(
-                string.Empty,
-                Array.Empty<string>(),
-                DeviceInformationKind.AssociationEndpoint);
+            var endpoints = await WithOperationTimeoutAsync(
+                ct => DeviceInformation.FindAllAsync(
+                        string.Empty,
+                        Array.Empty<string>(),
+                        DeviceInformationKind.AssociationEndpoint)
+                    .AsTask(ct),
+                AudioAssociationProbeTimeout,
+                probeToken,
+                "音频 AssociationEndpoint 枚举超时");
 
             var targetName = string.IsNullOrWhiteSpace(source.Name)
                 ? GetStringProperty(source, "System.ItemNameDisplay")

@@ -15,6 +15,7 @@ public sealed class DeviceStatusItemViewModel : INotifyPropertyChanged
     private string _batteryText = string.Empty;
     private string _isChargingText = string.Empty;
     private string _source = string.Empty;
+    private string _transportType = string.Empty;
     private string _lastUpdatedText = string.Empty;
     private string? _error;
     private string _errorText = string.Empty;
@@ -34,6 +35,7 @@ public sealed class DeviceStatusItemViewModel : INotifyPropertyChanged
         DeviceKey = status.DeviceKey;
         Name = status.Name;
         Source = status.Source;
+        TransportType = ResolveTransportType(status.Source, status.DeviceKey);
         IsConnectedText = status.IsConnected switch
         {
             true => "已连接",
@@ -94,6 +96,12 @@ public sealed class DeviceStatusItemViewModel : INotifyPropertyChanged
     {
         get => _source;
         private set => SetProperty(ref _source, value);
+    }
+
+    public string TransportType
+    {
+        get => _transportType;
+        private set => SetProperty(ref _transportType, value);
     }
 
     public string LastUpdatedText
@@ -175,5 +183,26 @@ public sealed class DeviceStatusItemViewModel : INotifyPropertyChanged
         }
 
         return text[..maxLength] + "...";
+    }
+
+    private static string ResolveTransportType(string? source, string? deviceKey)
+    {
+        var sourceText = source ?? string.Empty;
+        var keyText = deviceKey ?? string.Empty;
+
+        if (sourceText.Contains("Bluetooth", StringComparison.OrdinalIgnoreCase) ||
+            sourceText.Contains("蓝牙", StringComparison.OrdinalIgnoreCase))
+        {
+            return "蓝牙";
+        }
+
+        if (sourceText.Contains("2.4G", StringComparison.OrdinalIgnoreCase) ||
+            sourceText.Contains("HID", StringComparison.OrdinalIgnoreCase) ||
+            keyText.Contains("2.4g-hid-", StringComparison.OrdinalIgnoreCase))
+        {
+            return "2.4G";
+        }
+
+        return "其他";
     }
 }

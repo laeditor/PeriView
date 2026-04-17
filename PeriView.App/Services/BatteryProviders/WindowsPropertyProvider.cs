@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Windows.Devices.Bluetooth;
 using Windows.Devices.Enumeration;
 using PeriView.App.Services;
 
@@ -15,6 +16,7 @@ namespace PeriView.App.Services.BatteryProviders;
 /// </summary>
 public sealed class WindowsPropertyProvider : IBatteryProvider, IDisposable
 {
+    private static readonly TimeSpan ConnectionProbeTimeout = TimeSpan.FromSeconds(2);
     private readonly ConcurrentDictionary<string, DeviceInfo> _devices = new(StringComparer.OrdinalIgnoreCase);
     private IBatteryProviderContext? _context;
     private bool _disposed;
@@ -126,7 +128,25 @@ public sealed class WindowsPropertyProvider : IBatteryProvider, IDisposable
             // 从设备属性中读取电池百分比
             int? batteryPercent = TryGetBatteryPercentFromProperties(device.Properties);
             bool isCharging = false;
-            bool isConnected = TryGetConnectionStatus(device.Properties);
+            bool propertyConnected = TryGetConnectionStatus(device.Properties);
+            bool? runtimeConnected = await ResolveRuntimeConnectionAsync(device.Id, cancellationToken);
+            bool isConnected = runtimeConnected ?? propertyConnected;
+
+            if (IsLikelyPointerDevice(device) && runtimeConnected != true)
+            {
+                isConnected = false;
+            }
+
+            if (!isConnected)
+            {
+                if (_devices.TryRemove(deviceKey, out _))
+                {
+                    _context?.RemoveDevice(deviceKey);
+                }
+
+                Logger.Debug($"设备当前离线，已跳过并移除: {displayName}");
+                return;
+            }
             
             if (batteryPercent.HasValue)
             {
@@ -157,6 +177,58 @@ public sealed class WindowsPropertyProvider : IBatteryProvider, IDisposable
         }
         
         await Task.CompletedTask;
+    }
+
+    private static async Task<bool?> ResolveRuntimeConnectionAsync(string deviceId, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId))
+        {
+            return null;
+        }
+
+        try
+        {
+            var bleTask = BluetoothLEDevice.FromIdAsync(deviceId).AsTask(cancellationToken);
+            var completed = await Task.WhenAny(bleTask, Task.Delay(ConnectionProbeTimeout, cancellationToken));
+            if (completed == bleTask)
+            {
+                var ble = await bleTask;
+                if (ble is not null)
+                {
+                    using (ble)
+                    {
+                        return ble.ConnectionStatus == BluetoothConnectionStatus.Connected;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore BLE runtime probe errors.
+        }
+
+        try
+        {
+            var classicTask = BluetoothDevice.FromIdAsync(deviceId).AsTask(cancellationToken);
+            var completed = await Task.WhenAny(classicTask, Task.Delay(ConnectionProbeTimeout, cancellationToken));
+            if (completed == classicTask)
+            {
+                var classic = await classicTask;
+                if (classic is not null)
+                {
+                    using (classic)
+                    {
+                        return classic.ConnectionStatus == BluetoothConnectionStatus.Connected;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore classic runtime probe errors.
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -244,6 +316,34 @@ public sealed class WindowsPropertyProvider : IBatteryProvider, IDisposable
         return false;
     }
 
+    private static bool IsLikelyPointerDevice(DeviceInformation device)
+    {
+        var name = device.Name;
+        if (string.IsNullOrWhiteSpace(name) &&
+            device.Properties.TryGetValue("System.ItemNameDisplay", out var displayNameObj) &&
+            displayNameObj is string displayName)
+        {
+            name = displayName;
+        }
+
+        var lowered = (name ?? string.Empty).ToLowerInvariant();
+        if (lowered.Contains("mouse") || lowered.Contains("mice") || lowered.Contains("trackball") || lowered.Contains("鼠标"))
+        {
+            return true;
+        }
+
+        if (device.Properties.TryGetValue("System.Devices.ClassGuid", out var classGuidObj) && classGuidObj is not null)
+        {
+            var classGuid = classGuidObj.ToString();
+            if (!string.IsNullOrWhiteSpace(classGuid) && classGuid.Contains("4d36e96f", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>
     /// 获取设备显示名称
     /// </summary>
@@ -265,7 +365,17 @@ public sealed class WindowsPropertyProvider : IBatteryProvider, IDisposable
     /// </summary>
     private string GetDeviceKey(DeviceInformation device)
     {
-        // 使用设备ID作为唯一标识
+        if (device.Properties.TryGetValue("System.Devices.Aep.ContainerId", out var container) && container is Guid guid && guid != Guid.Empty)
+        {
+            return guid.ToString("D");
+        }
+
+        if (device.Properties.TryGetValue("System.Devices.ContainerId", out var container2) && container2 is Guid guid2 && guid2 != Guid.Empty)
+        {
+            return guid2.ToString("D");
+        }
+
+        // 兜底：使用设备ID哈希
         return $"windows_property_{device.Id.GetHashCode():X8}";
     }
 
