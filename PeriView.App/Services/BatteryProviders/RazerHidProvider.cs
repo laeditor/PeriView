@@ -187,39 +187,10 @@ public sealed class RazerHidProvider : IBatteryProvider, IDisposable
     /// </summary>
     private async Task<(int Percent, bool IsCharging, bool IsSleeping)?> ReadBatteryViaHid(HidDevice device, CancellationToken cancellationToken)
     {
-        try
-        {
-            // 雷蛇设备通常使用特征报告来读取电池状态
-            if (device.GetMaxFeatureReportLength() <= 0)
-            {
-                Logger.Debug($"设备不支持特征报告: {device.DevicePath}");
-                return null;
-            }
-            
-            using (var stream = device.Open())
-            {
-                stream.ReadTimeout = 1500;
-                
-                // 雷蛇设备可能使用特定的报告ID
-                // 这里需要根据具体设备实现
-                
-                // 模拟读取
-                await Task.Delay(100, cancellationToken);
-                
-                // 模拟返回数据
-                var random = new Random();
-                int percent = random.Next(0, 101);
-                bool isCharging = random.Next(0, 2) == 1;
-                bool isSleeping = random.Next(0, 10) == 0;
-                
-                return (percent, isCharging, isSleeping);
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.Error($"HID通信失败: {device.DevicePath}", ex);
-            return null;
-        }
+        // 雷蛇设备的私有 HID 电池协议尚未实现。
+        // 禁止使用随机值或模拟数据，避免把离线设备错误显示为在线。
+        await Task.CompletedTask;
+        return null;
     }
 
     /// <summary>

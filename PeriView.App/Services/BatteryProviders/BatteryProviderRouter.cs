@@ -30,9 +30,9 @@ public class BatteryProviderRouter : IDeviceStatusProvider
         _context = new BatteryProviderContext();
         
         // 注册默认提供者（按优先级顺序）
+        // 注意：LogitechHidProvider 和 RazerHidProvider 的 HID 电池协议尚未实现，
+        // 暂时取消注册以避免产生不可靠的电量数据。
         RegisterProvider(new WindowsPropertyProvider());
-        RegisterProvider(new LogitechHidProvider());
-        RegisterProvider(new RazerHidProvider());
         RegisterProvider(new XboxGamepadProvider());
     }
 

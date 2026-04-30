@@ -198,37 +198,10 @@ public sealed class LogitechHidProvider : IBatteryProvider, IDisposable
     /// </summary>
     private async Task<(int Percent, bool IsCharging, bool IsSleeping)?> ReadBatteryViaHid(HidDevice device, CancellationToken cancellationToken)
     {
-        try
-        {
-            // 检查设备是否支持特征报告
-            if (device.GetMaxFeatureReportLength() <= 0)
-            {
-                Logger.Debug($"设备不支持特征报告: {device.DevicePath}");
-                return null;
-            }
-            
-            using (var stream = device.Open())
-            {
-                stream.ReadTimeout = 1500;
-                
-                // 根据设备类型选择不同的报告ID
-                byte reportId = 0x00;
-                var buffer = new byte[device.GetMaxFeatureReportLength()];
-                
-                // 设置报告ID
-                buffer[0] = reportId;
-
-                // 当前尚未实现稳定的罗技私有HID电池协议，
-                // 禁止使用随机值，避免把离线设备错误显示为在线。
-                await Task.CompletedTask;
-                return null;
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.Error($"HID通信失败: {device.DevicePath}", ex);
-            return null;
-        }
+        // 罗技设备的私有 HID 电池协议尚未实现稳定的读取方案。
+        // 禁止使用随机值或模拟数据，避免把离线设备错误显示为在线。
+        await Task.CompletedTask;
+        return null;
     }
 
     private static bool IsInfrastructureReceiver(HidDevice device, string displayName)

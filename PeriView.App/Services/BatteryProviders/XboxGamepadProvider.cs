@@ -191,7 +191,9 @@ public sealed class XboxGamepadProvider : IBatteryProvider, IDisposable
     /// </summary>
     private string GetDeviceKey(RawGameController controller)
     {
-        return $"xbox_gamepad_{controller.HardwareVendorId:X4}_{controller.HardwareProductId:X4}_{controller.NonRoamableId.GetHashCode():X8}";
+        // 使用 NonRoamableId 原始字符串而非 GetHashCode()，避免哈希碰撞风险
+        var stableId = controller.NonRoamableId?.Replace(":", "").Replace("-", "").Replace(" ", "") ?? "unknown";
+        return $"xbox_gamepad_{controller.HardwareVendorId:X4}_{controller.HardwareProductId:X4}_{stableId}";
     }
 
     /// <summary>

@@ -189,14 +189,9 @@ public sealed class BluetoothDiscoveryCache
 
     private static Task<IReadOnlyList<UiBatteryEntry>> LoadUiBatteryEntriesAsync()
     {
-        return Task.Run<IReadOnlyList<UiBatteryEntry>>(() => CollectUiBatteryEntriesSnapshot());
-    }
-
-    private static IReadOnlyList<UiBatteryEntry> CollectUiBatteryEntriesSnapshot()
-    {
-        // TODO: 实现UI电池条目收集逻辑
-        // 原方法在BluetoothBatteryProvider中，需要提取
-        return Array.Empty<UiBatteryEntry>();
+        // UI 自动化电池条目收集尚未实现，直接返回空列表。
+        // TODO: 从 BluetoothBatteryProvider 中提取 UI 自动化文本解析逻辑至此。
+        return Task.FromResult<IReadOnlyList<UiBatteryEntry>>(Array.Empty<UiBatteryEntry>());
     }
 }
 

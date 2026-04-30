@@ -1118,12 +1118,12 @@ public sealed class BluetoothBatteryProvider : IDeviceStatusProvider
             short s => s,
             ushort us => us,
             int i => i,
-            uint ui => unchecked((int)ui),
-            long l => (int)l,
-            ulong ul => (int)ul,
-            float f => (int)f,
-            double d => (int)d,
-            decimal dc => (int)dc,
+            uint ui => (int)Math.Min(ui, 100u),  // 限制 uint 范围，避免 unchecked 溢出产生负值
+            long l => (int)Math.Clamp(l, 0, 100),
+            ulong ul => (int)Math.Min(ul, 100uL),
+            float f => (int)Math.Clamp(f, 0, 100),
+            double d => (int)Math.Clamp(d, 0, 100),
+            decimal dc => (int)Math.Clamp(dc, 0, 100),
             string text when int.TryParse(text, out var i) => i,
             string text when float.TryParse(text, out var f) => (int)f,
             // Windows 有时以 IInspectable/PropertyValue 形式返回，尝试转换

@@ -46,7 +46,7 @@ public sealed class MainViewModel : ObservableObject
         _refreshTimer.Tick += async (_, _) => await RefreshAsync();
         _refreshTimer.Start();
 
-        _ = RefreshAsync();
+        _ = SafeRefreshAsync();
     }
 
     public ObservableCollection<DeviceStatusItemViewModel> Devices { get; } = new();
@@ -112,6 +112,21 @@ public sealed class MainViewModel : ObservableObject
 
         Devices.Move(sourceIndex, targetIndex);
         SelectedDevice = source;
+    }
+
+    /// <summary>
+    /// 安全地执行异步刷新，捕获所有异常避免未观察到的 Task 异常导致进程崩溃。
+    /// </summary>
+    private async Task SafeRefreshAsync()
+    {
+        try
+        {
+            await RefreshAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error("后台刷新发生未处理异常", ex);
+        }
     }
 
     private async Task RefreshAsync()
